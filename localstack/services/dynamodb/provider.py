@@ -19,8 +19,12 @@ from localstack.aws.api import (
     handler,
 )
 from localstack.aws.api.dynamodb import (
+    BatchExecuteStatementOutput,
+    BatchGetItemOutput,
+    BatchGetRequestMap,
     BatchWriteItemInput,
     BatchWriteItemOutput,
+    BillingMode,
     CreateGlobalTableOutput,
     CreateTableInput,
     CreateTableOutput,
@@ -34,6 +38,8 @@ from localstack.aws.api.dynamodb import (
     DynamodbApi,
     ExecuteStatementInput,
     ExecuteStatementOutput,
+    ExecuteTransactionInput,
+    ExecuteTransactionOutput,
     GetItemInput,
     GetItemOutput,
     GlobalTableAlreadyExistsException,
@@ -44,6 +50,7 @@ from localstack.aws.api.dynamodb import (
     ListTablesOutput,
     ListTagsOfResourceOutput,
     NextTokenString,
+    PartiQLBatchRequest,
     PositiveIntegerObject,
     ProvisionedThroughputExceededException,
     PutItemInput,
@@ -56,6 +63,7 @@ from localstack.aws.api.dynamodb import (
     ResourceArnString,
     ResourceInUseException,
     ResourceNotFoundException,
+    ReturnConsumedCapacity,
     ScanInput,
     ScanOutput,
     StreamArn,
@@ -63,6 +71,8 @@ from localstack.aws.api.dynamodb import (
     TagKeyList,
     TagList,
     TimeToLiveSpecification,
+    TransactGetItemList,
+    TransactGetItemsOutput,
     TransactWriteItemsInput,
     TransactWriteItemsOutput,
     UpdateGlobalTableOutput,
@@ -383,9 +393,17 @@ class DynamoDBProvider(DynamodbApi, ServiceLifecycleHook):
         table_name = create_table_input["TableName"]
         if self.table_exists(table_name):
             raise ResourceInUseException("Cannot create preexisting table")
+        billing_mode = create_table_input.get("BillingMode")
+        provisioned_throughput = create_table_input.get("ProvisionedThroughput")
+        if billing_mode == BillingMode.PAY_PER_REQUEST and provisioned_throughput is not None:
+            raise ValidationException(
+                "One or more parameter values were invalid: Neither ReadCapacityUnits nor WriteCapacityUnits can be "
+                "specified when BillingMode is PAY_PER_REQUEST"
+            )
 
         # forward request to backend
         result = self.forward_request(context)
+        table_description = result["TableDescription"]
 
         backend = DynamoDBRegion.get()
         backend.table_definitions[table_name] = table_definitions = dict(create_table_input)
@@ -400,19 +418,26 @@ class DynamoDBProvider(DynamodbApi, ServiceLifecycleHook):
         if table_definitions:
             table_content = result.get("Table", {})
             table_content.update(table_definitions)
-            result["TableDescription"].update(table_content)
+            table_description.update(table_content)
 
         if "StreamSpecification" in table_definitions:
-            create_dynamodb_stream(
-                table_definitions, result["TableDescription"].get("LatestStreamLabel")
+            create_dynamodb_stream(table_definitions, table_description.get("LatestStreamLabel"))
+
+        if "TableClass" in table_definitions:
+            table_class = table_description.pop("TableClass", None) or table_definitions.pop(
+                "TableClass"
             )
+            table_description["TableClassSummary"] = {"TableClass": table_class}
 
         tags = table_definitions.pop("Tags", [])
-        result["TableDescription"].pop("Tags", None)
         if tags:
-            table_arn = result["TableDescription"]["TableArn"]
+            table_arn = table_description["TableArn"]
             table_arn = self.fix_table_arn(table_arn)
             DynamoDBRegion.TABLE_TAGS[table_arn] = {tag["Key"]: tag["Value"] for tag in tags}
+
+        # remove invalid attributes from result
+        table_description.pop("Tags", None)
+        table_description.pop("BillingMode", None)
 
         event_publisher.fire_event(
             event_publisher.EVENT_DYNAMODB_CREATE_TABLE,
@@ -460,6 +485,10 @@ class DynamoDBProvider(DynamodbApi, ServiceLifecycleHook):
             for key in ["TableId", "SSEDescription"]:
                 if table_definitions.get(key):
                     result.get("Table", {})[key] = table_definitions[key]
+            if "TableClass" in table_definitions:
+                result.get("Table", {})["TableClassSummary"] = {
+                    "TableClass": table_definitions["TableClass"]
+                }
 
         return result
 
@@ -474,8 +503,20 @@ class DynamoDBProvider(DynamodbApi, ServiceLifecycleHook):
             is_no_update_error = (
                 e.code == "ValidationException" and "Nothing to update" in e.message
             )
-            if is_no_update_error and update_table_input.get("ReplicaUpdates"):
-                table_name = update_table_input.get("TableName")
+            if not is_no_update_error or not list(
+                {"TableClass", "ReplicaUpdates"} & set(update_table_input.keys())
+            ):
+                raise
+
+            table_name = update_table_input.get("TableName")
+
+            if update_table_input.get("TableClass"):
+                table_definitions = DynamoDBRegion.get().table_definitions.setdefault(
+                    table_name, {}
+                )
+                table_definitions["TableClass"] = update_table_input.get("TableClass")
+
+            if update_table_input.get("ReplicaUpdates"):
                 # update local table props (replicas)
                 table_properties = DynamoDBRegion.get().table_properties
                 table_properties[table_name] = table_props = table_properties.get(table_name) or {}
@@ -494,10 +535,10 @@ class DynamoDBProvider(DynamodbApi, ServiceLifecycleHook):
                             table_props["Replicas"] = [
                                 r for r in replicas if r.get("RegionName") != region
                             ]
-                # update response content
-                schema = SchemaExtractor.get_table_schema(table_name)
-                return UpdateTableOutput(TableDescription=schema["Table"])
-            raise
+
+            # update response content
+            schema = SchemaExtractor.get_table_schema(table_name)
+            return UpdateTableOutput(TableDescription=schema["Table"])
 
         if "StreamSpecification" in update_table_input:
             create_dynamodb_stream(
@@ -710,6 +751,15 @@ class DynamoDBProvider(DynamodbApi, ServiceLifecycleHook):
 
         return result
 
+    @handler("BatchGetItem")
+    def batch_get_item(
+        self,
+        context: RequestContext,
+        request_items: BatchGetRequestMap,
+        return_consumed_capacity: ReturnConsumedCapacity = None,
+    ) -> BatchGetItemOutput:
+        return self.forward_request(context)
+
     @handler("TransactWriteItems", expand=False)
     def transact_write_items(
         self,
@@ -743,6 +793,22 @@ class DynamoDBProvider(DynamodbApi, ServiceLifecycleHook):
         if event_sources_or_streams_enabled:
             self.forward_stream_records(records)
 
+        return result
+
+    @handler("TransactGetItems", expand=False)
+    def transact_get_items(
+        self,
+        context: RequestContext,
+        transact_items: TransactGetItemList,
+        return_consumed_capacity: ReturnConsumedCapacity = None,
+    ) -> TransactGetItemsOutput:
+        return self.forward_request(context)
+
+    @handler("ExecuteTransaction", expand=False)
+    def execute_transaction(
+        self, context: RequestContext, execute_transaction_input: ExecuteTransactionInput
+    ) -> ExecuteTransactionOutput:
+        result = self.forward_request(context)
         return result
 
     @handler("ExecuteStatement", expand=False)
@@ -1096,6 +1162,15 @@ class DynamoDBProvider(DynamodbApi, ServiceLifecycleHook):
                 i += 1
         return records
 
+    def batch_execute_statement(
+        self,
+        context: RequestContext,
+        statements: PartiQLBatchRequest,
+        return_consumed_capacity: ReturnConsumedCapacity = None,
+    ) -> BatchExecuteStatementOutput:
+        result = self.forward_request(context)
+        return result
+
     def prepare_batch_write_item_records(
         self,
         request_items,
@@ -1225,9 +1300,19 @@ def get_global_secondary_index(table_name, index_name):
     raise ResourceNotFoundException("Index not found")
 
 
+def is_local_secondary_index(table_name, index_name) -> bool:
+    schema = SchemaExtractor.get_table_schema(table_name)
+    for index in schema["Table"].get("LocalSecondaryIndexes", []):
+        if index["IndexName"] == index_name:
+            return True
+    return False
+
+
 def is_index_query_valid(query_data: dict) -> bool:
     table_name = to_str(query_data["TableName"])
     index_name = to_str(query_data["IndexName"])
+    if is_local_secondary_index(table_name, index_name):
+        return True
     index_query_type = query_data.get("Select")
     index = get_global_secondary_index(table_name, index_name)
     index_projection_type = index.get("Projection").get("ProjectionType")
@@ -1254,7 +1339,7 @@ def has_event_sources_or_streams_enabled(table_name: str, cache: Dict = None):
 
     # if kinesis streaming destination is enabled
     # get table name from table_arn
-    # since batch_wrtie and transact write operations passing table_arn instead of table_name
+    # since batch_write and transact write operations passing table_arn instead of table_name
     table_name = table_arn.split("/", 1)[-1]
     table_definitions = DynamoDBRegion.get().table_definitions
     if not result and table_definitions.get(table_name):

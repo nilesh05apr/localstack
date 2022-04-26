@@ -32,7 +32,6 @@ from localstack.utils.aws import aws_stack
 from localstack.utils.aws.message_forwarding import send_event_to_target
 from localstack.utils.common import TMP_FILES, mkdir, save_file, truncate
 from localstack.utils.json import extract_jsonpath
-from localstack.utils.patch import patch
 from localstack.utils.strings import long_uid, short_uid
 
 LOG = logging.getLogger(__name__)
@@ -46,6 +45,7 @@ CONTENT_BASE_FILTER_KEYWORDS = ["prefix", "anything-but", "numeric", "cidr", "ex
 
 class EventsProvider(EventsApi):
     def __init__(self):
+        apply_patches()
         JobScheduler.start()
 
     @staticmethod
@@ -65,7 +65,7 @@ class EventsProvider(EventsApi):
                 event = json.loads(event_str)
                 attr = aws_stack.get_events_target_attributes(target)
                 try:
-                    send_event_to_target(arn, event, target_attributes=attr)
+                    send_event_to_target(arn, event, target_attributes=attr, target=target)
                 except Exception as e:
                     LOG.info(
                         f"Unable to send event notification {truncate(event)} to target {target}: {e}"
@@ -302,28 +302,29 @@ def handle_prefix_filtering(event_pattern, value):
     return False
 
 
-def identify_content_base_parameter_in_pattern(parameters):
-    if any(
+def identify_content_base_parameter_in_pattern(parameters) -> bool:
+    return any(
         list(param.keys())[0] in CONTENT_BASE_FILTER_KEYWORDS
         for param in parameters
         if isinstance(param, dict)
-    ):
-        return True
+    )
 
 
-def get_two_lists_intersection(lst1, lst2):
+def get_two_lists_intersection(lst1: List, lst2: List) -> List:
     lst3 = [value for value in lst1 if value in lst2]
     return lst3
 
 
-# TODO: refactor/simplify
+# TODO: refactor/simplify!
 def filter_event_based_on_event_format(self, rule_name: str, event: Dict[str, Any]):
     def filter_event(event_pattern_filter: Dict[str, Any], event: Dict[str, Any]):
         for key, value in event_pattern_filter.items():
-            event_value = event.get(key.lower())
+            # match keys in the event in a case-agnostic way
+            event_value = event.get(key.lower(), event.get(key))
             if event_value is None:
                 return False
 
+            # 1. check if certain values in the event do not match the expected pattern
             if event_value and isinstance(event_value, dict):
                 for key_a, value_a in event_value.items():
                     if key_a == "ip":
@@ -336,23 +337,25 @@ def filter_event_based_on_event_format(self, rule_name: str, event: Dict[str, An
                         if not handle_prefix_filtering(value.get(key_a), value_a):
                             return False
 
-            elif isinstance(value, list) and not identify_content_base_parameter_in_pattern(value):
-                if (
-                    isinstance(event_value, list)
-                    and get_two_lists_intersection(value, event_value) == []
-                ):
-                    return False
-                elif (
-                    not isinstance(event_value, list)
-                    and isinstance(event_value, (str, int))
-                    and event_value not in value
-                ):
-                    return False
+            # 2. check if the pattern is a list and event values are not contained in it
+            if isinstance(value, list):
+                if identify_content_base_parameter_in_pattern(value):
+                    if not filter_event_with_content_base_parameter(value, event_value):
+                        return False
+                else:
+                    if (
+                        isinstance(event_value, list)
+                        and get_two_lists_intersection(value, event_value) == []
+                    ):
+                        return False
+                    if (
+                        not isinstance(event_value, list)
+                        and isinstance(event_value, (str, int))
+                        and event_value not in value
+                    ):
+                        return False
 
-            elif isinstance(value, list) and identify_content_base_parameter_in_pattern(value):
-                if not filter_event_with_content_base_parameter(value, event_value):
-                    return False
-
+            # 3. recursively call filter_event(..) for dict types
             elif isinstance(value, (str, dict)):
                 try:
                     value = json.loads(value) if isinstance(value, str) else value
@@ -360,6 +363,7 @@ def filter_event_based_on_event_format(self, rule_name: str, event: Dict[str, An
                         return False
                 except json.decoder.JSONDecodeError:
                     return False
+
         return True
 
     rule_information = self.events_backend.describe_rule(rule_name)
@@ -384,22 +388,25 @@ def process_events(event: Dict, targets: List[Dict]):
     for target in targets:
         arn = target["Arn"]
         changed_event = filter_event_with_target_input_path(target, event)
+        if target.get("Input"):
+            changed_event = json.loads(target.get("Input"))
         try:
-            send_event_to_target(arn, changed_event, aws_stack.get_events_target_attributes(target))
+            send_event_to_target(
+                arn, changed_event, aws_stack.get_events_target_attributes(target), target=target
+            )
         except Exception as e:
             LOG.info(f"Unable to send event notification {truncate(event)} to target {target}: {e}")
 
 
-# TODO: this migration. can I tidy up these dictionaries in this migration??
-@patch(MotoEventsHandler.put_events)
-def events_handler_put_events(_, self):
+# specific logic for put_events which forwards matching events to target listeners
+def events_handler_put_events(self):
     entries = self._get_param("Entries")
 
     # keep track of events for local integration testing
     if config.is_local_test_mode():
-        TEST_EVENTS_CACHE.extend(entries or [])
+        TEST_EVENTS_CACHE.extend(entries)
 
-    events = list(map(lambda event: {"event": event, "uuid": long_uid()}, entries))
+    events = list(map(lambda event: {"event": event, "uuid": str(long_uid())}, entries))
 
     _dump_events_to_files(events)
     event_rules = self.events_backend.rules
@@ -408,8 +415,8 @@ def events_handler_put_events(_, self):
         event = event_envelope["event"]
         event_bus = event.get("EventBusName") or DEFAULT_EVENT_BUS_NAME
 
-        matching_rules = [r for r in event_rules.values() if r.event_bus_name == event_bus]
-        if not matching_rules:
+        matchine_rules = [r for r in event_rules.values() if r.event_bus_name == event_bus]
+        if not matchine_rules:
             continue
 
         formatted_event = {
@@ -425,14 +432,13 @@ def events_handler_put_events(_, self):
         }
 
         targets = []
-        for rule in matching_rules:
+        for rule in matchine_rules:
             if filter_event_based_on_event_format(self, rule.name, formatted_event):
                 targets.extend(self.events_backend.list_targets_by_rule(rule.name)["Targets"])
 
         # process event
         process_events(formatted_event, targets)
 
-    # failed_count = len([e for e in entries if "ErrorCode" in e])
     content = {
         "FailedEntryCount": 0,  # TODO: dynamically set proper value when refactoring
         "Entries": list(map(lambda event: {"EventId": event["uuid"]}, events)),
@@ -445,12 +451,15 @@ def events_handler_put_events(_, self):
     return json.dumps(content), self.response_headers
 
 
-# TODO: evaluate for this migration! this was in the starter but doesn't seem relevant anymore???
-# Fix events ARN
-# def rule_model_generate_arn(self, name):
-#     return "arn:aws:events:{region_name}:{account_id}:rule/{name}".format(
-#         region_name=self.region_name, account_id=TEST_AWS_ACCOUNT_ID, name=name
-#     )
-#
-#
-# rule_model._generate_arn = rule_model_generate_arn
+def apply_patches():
+    MotoEventsHandler.put_events = events_handler_put_events
+
+    # TODO: evaluate for this migration! this was in the starter but doesn't seem relevant anymore???
+    # Fix events ARN
+    # def rule_model_generate_arn(self, name):
+    #     return "arn:aws:events:{region_name}:{account_id}:rule/{name}".format(
+    #         region_name=self.region_name, account_id=TEST_AWS_ACCOUNT_ID, name=name
+    #     )
+    #
+    #
+    # rule_model._generate_arn = rule_model_generate_arn
